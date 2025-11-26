@@ -23,6 +23,12 @@ For development:
 pip install puredds[dev]
 ```
 
+From local wheel file:
+```bash
+# First build using instructions below
+pip install ./dist/puredds-version-pyX-none-any.whl
+```
+
 ## Usage
 
 ### As a Library
