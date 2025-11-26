@@ -29,6 +29,7 @@ dependencies = [
     "Pillow>=8.0.0",
     "numba>=0.56.0",
 ]
+license = "Apache-2.0"
 
 [project.optional-dependencies]
 dev = [
@@ -40,7 +41,7 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/WoefulWolf/puredds"
 Repository = "https://github.com/WoefulWolf/puredds"
-"Bug Tracker" = "https://github.com/WoefulWolf/puredds/issues"
+Issues = "https://github.com/WoefulWolf/puredds/issues"
 
 [project.scripts]
 puredds = "puredds:main"
