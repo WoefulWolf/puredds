@@ -381,35 +381,27 @@ class DDS:
 
     def get_format_str(self) -> str:
         """Get a human-readable format string"""
-        # Determine format
-        fourcc = None
-        dxgi_format = None
+        # Try to get DXGI format (works for both DX10 header and FourCC)
+        dxgi_format_value = self.get_dxgi_format()
 
-        if self.header10:
-            dxgi_format = self.header10.dxgiFormat
-        elif self.header.ddspf.dwFlags & DDPF.FOURCC:
-            fourcc = self.header.ddspf.dwFourCC
-
-        # Try to interpret fourcc as DXGI format if it's a small integer
-        if fourcc is not None and dxgi_format is None and fourcc < 256:
+        if dxgi_format_value is not None:
             try:
-                dxgi_format = DXGI_FORMAT(fourcc)
-                fourcc = None  # Clear fourcc since we're using dxgi_format
+                dxgi_format = DXGI_FORMAT(dxgi_format_value)
+                return f"{dxgi_format.name}"
             except ValueError:
                 pass
 
-        if fourcc:
+        # No DXGI equivalent - check if we have a FourCC
+        if self.header.ddspf.dwFlags & DDPF.FOURCC:
+            fourcc = self.header.ddspf.dwFourCC
             try:
                 fourcc_enum = FourCC(fourcc)
-                format_str = f"FourCC {fourcc_enum.name}"
+                return f"FourCC {fourcc_enum.name}"
             except ValueError:
                 fourcc_bytes = fourcc.to_bytes(4, 'little')
-                format_str = f"FourCC 0x{fourcc:08X} ({fourcc_bytes})"
-        elif dxgi_format:
-            format_str = f"{dxgi_format.name}"
-        else:
-            format_str = "Unknown format"
-        return format_str
+                return f"FourCC 0x{fourcc:08X} ({fourcc_bytes})"
+
+        return "Unknown format"
 
     def get_width(self) -> int:
         """Get the width of the texture in pixels"""
@@ -434,10 +426,47 @@ class DDS:
     def get_dxgi_format(self) -> Optional[int]:
         """
         Get the DXGI format enum value (integer).
-        Returns None if not using DX10 extended header.
+        Returns the DXGI format from DX10 header if present,
+        otherwise returns the equivalent DXGI format for FourCC codes.
+        Returns None if no equivalent DXGI format exists.
         """
+        # If DX10 header exists, return its DXGI format
         if self.header10:
             return self.header10.dxgiFormat.value
+
+        # Check if we have a FourCC code
+        if self.header.ddspf.dwFlags & DDPF.FOURCC:
+            fourcc = self.header.ddspf.dwFourCC
+
+            # Map FourCC codes to equivalent DXGI formats
+            fourcc_to_dxgi = {
+                FourCC.DXT1: DXGI_FORMAT.BC1_UNORM,
+                FourCC.DXT2: DXGI_FORMAT.BC2_UNORM,  # Premultiplied alpha
+                FourCC.DXT3: DXGI_FORMAT.BC2_UNORM,
+                FourCC.DXT4: DXGI_FORMAT.BC3_UNORM,  # Premultiplied alpha
+                FourCC.DXT5: DXGI_FORMAT.BC3_UNORM,
+                FourCC.BC4U: DXGI_FORMAT.BC4_UNORM,
+                FourCC.BC4S: DXGI_FORMAT.BC4_SNORM,
+                FourCC.BC5U: DXGI_FORMAT.BC5_UNORM,
+                FourCC.BC5S: DXGI_FORMAT.BC5_SNORM,
+                FourCC.ATI1: DXGI_FORMAT.BC4_UNORM,
+                FourCC.ATI2: DXGI_FORMAT.BC5_UNORM,
+            }
+
+            # Try to find mapping for this FourCC
+            if fourcc in fourcc_to_dxgi:
+                return fourcc_to_dxgi[fourcc].value
+
+            # Some DDS files store DXGI format codes directly in dwFourCC
+            # Try to interpret as DXGI format if it's a small integer
+            if fourcc < 256:
+                try:
+                    dxgi_format = DXGI_FORMAT(fourcc)
+                    return dxgi_format.value
+                except ValueError:
+                    pass
+
+        # No equivalent DXGI format found
         return None
 
     def get_subresource_count(self) -> int:
