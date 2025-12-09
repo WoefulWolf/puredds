@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "puredds"
-version = "0.2.0"
+version = "0.4.0"
 description = "High-performance DDS (DirectDraw Surface) texture file reader and converter with Numba JIT optimization"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
     {name = "Woeful_Wolf"}
 ]
-keywords = ["dds", "texture", "directdraw", "surface", "image", "converter", "bc1", "bc2", "bc3", "bc4", "bc5", "dxt1", "dxt3", "dxt5"]
+keywords = ["dds", "texture", "directdraw", "surface", "image", "converter", "bc1", "bc2", "bc3", "bc4", "bc5", "bc7", "dxt1", "dxt3", "dxt5", "bptc"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -26,7 +26,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.20.0",
-    "Pillow>=8.0.0",
+    "imageio>=2.30.0",
     "numba>=0.56.0",
 ]
 license = "Apache-2.0"

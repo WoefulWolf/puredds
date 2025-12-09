@@ -1,0 +1,782 @@
+"""Main DDS file handler"""
+from typing import Optional, List
+import numpy as np
+
+from .enums import DDPF, DDSCAPS2, FourCC, DXGI_FORMAT
+from .headers import DDS_HEADER, DDS_HEADER_DXT10
+from .decompressors import (
+    TextureDecompressor,
+    BC1Decompressor,
+    BC2Decompressor,
+    BC3Decompressor,
+    BC4Decompressor,
+    BC5Decompressor,
+    BC7Decompressor,
+)
+
+
+def _unpremultiply_alpha(rgba_data: np.ndarray) -> np.ndarray:
+    """
+    Convert premultiplied alpha to straight alpha.
+
+    In premultiplied alpha, RGB values are stored as RGB × Alpha.
+    This function converts them back to the original RGB values.
+
+    Args:
+        rgba_data: numpy array of shape (height, width, 4) with dtype uint8 (RGBA)
+                where RGB values are premultiplied by alpha
+
+    Returns:
+        numpy array of shape (height, width, 4) with dtype uint8 (RGBA)
+        with straight (non-premultiplied) alpha
+    """
+    # Work with float to avoid precision loss
+    result = rgba_data.astype(np.float32)
+
+    # Get alpha channel
+    alpha = result[:, :, 3]
+
+    # Create a mask for non-zero alpha to avoid division by zero
+    # Where alpha > 0, we'll un-premultiply
+    non_zero_mask = alpha > 0
+
+    # Un-premultiply RGB channels where alpha > 0
+    # RGB_original = RGB_premultiplied / (Alpha / 255)
+    for channel in range(3):  # R, G, B channels
+        result[:, :, channel] = np.where(
+            non_zero_mask,
+            np.clip(result[:, :, channel] * 255.0 / alpha, 0, 255),
+            result[:, :, channel]
+        )
+
+    # Convert back to uint8
+    return result.astype(np.uint8)
+
+
+class DDS:
+    """DirectDraw Surface container"""
+    def __init__(self) -> None:
+        self.magic: bytes = b'DDS '  # Magic number (always "DDS ")
+        self.header: DDS_HEADER = DDS_HEADER()
+        self.header10: Optional[DDS_HEADER_DXT10] = None  # Optional DX10 extended header
+        self.data: List[bytes] = []  # List of subresources (mipmap levels, array slices, cubemap faces)
+
+    def __str__(self) -> str:
+        """Return debug string representation of DDS file"""
+        lines = ["DDS File Information:"]
+        lines.append(f"  Magic: {self.magic}")
+        lines.append(f"  Dimensions: {self.header.dwWidth}x{self.header.dwHeight}")
+
+        if self.header.dwDepth > 0:
+            lines.append(f"  Depth: {self.header.dwDepth}")
+
+        if self.header.dwMipMapCount > 0:
+            lines.append(f"  Mipmap Levels: {self.header.dwMipMapCount}")
+
+        lines.append(f"  Flags: {self.header.dwFlags}")
+
+        # Format information
+        if self.header10:
+            lines.append(f"  Format: DX10")
+            lines.append(f"    DXGI Format: {self.header10.dxgiFormat.name} ({self.header10.dxgiFormat.value})")
+            lines.append(f"    Resource Dimension: {self.header10.resourceDimension.name}")
+            if self.header10.arraySize > 1:
+                lines.append(f"    Array Size: {self.header10.arraySize}")
+            if self.header10.miscFlag:
+                lines.append(f"    Misc Flags: {self.header10.miscFlag}")
+        else:
+            # Try to decode FourCC if present
+            if self.header.ddspf.dwFlags & DDPF.FOURCC:
+                fourcc = self.header.ddspf.dwFourCC
+                try:
+                    fourcc_enum = FourCC(fourcc)
+                    fourcc_str = fourcc_enum.name
+                except ValueError:
+                    # Unknown FourCC, display as bytes
+                    fourcc_bytes = fourcc.to_bytes(4, 'little')
+                    fourcc_str = fourcc_bytes.decode('ascii', errors='replace')
+                lines.append(f"  Format: FourCC '{fourcc_str}' (0x{fourcc:08X})")
+            elif self.header.ddspf.dwFlags & DDPF.RGB:
+                lines.append(f"  Format: Uncompressed RGB ({self.header.ddspf.dwRGBBitCount}-bit)")
+                if self.header.ddspf.dwFlags & DDPF.ALPHAPIXELS:
+                    lines.append(f"    With Alpha")
+            else:
+                lines.append(f"  Format: Other (flags: {self.header.ddspf.dwFlags})")
+
+        lines.append(f"  Caps: {self.header.dwCaps}")
+        if self.header.dwCaps2:
+            lines.append(f"  Caps2: {self.header.dwCaps2}")
+
+        total_data_size = sum(len(subresource) for subresource in self.data)
+        lines.append(f"  Subresources: {len(self.data)}")
+        lines.append(f"  Total Data Size: {total_data_size} bytes")
+
+        return "\n".join(lines)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'DDS':
+        """Read DDS from bytes"""
+        if len(data) < 128:  # Minimum: 4 (magic) + 124 (header)
+            raise ValueError(f"Data too small for DDS file: {len(data)} bytes")
+
+        dds = cls()
+        offset = 0
+
+        # Read and validate magic number
+        dds.magic = data[offset:offset+4]
+        if dds.magic != b'DDS ':
+            raise ValueError(f"Invalid DDS magic number: {dds.magic}")
+        offset += 4
+
+        # Read DDS header
+        dds.header = DDS_HEADER.from_bytes(data[offset:offset+124])
+        offset += 124
+
+        # Check if DX10 extended header is present
+        if dds.header.ddspf.dwFourCC == FourCC.DX10:
+            if len(data) < offset + 20:
+                raise ValueError(f"Incomplete DX10 header")
+            dds.header10 = DDS_HEADER_DXT10.from_bytes(data[offset:offset+20])
+            offset += 20
+
+        # Split image data into subresources
+        dds._split_subresources(data[offset:])
+
+        return dds
+
+    def _split_subresources(self, raw_data: bytes) -> None:
+        """
+        Split raw image data into subresources.
+
+        Subresources are ordered as:
+        - For each array slice:
+          - For each face (6 for cubemap, 1 otherwise):
+            - For each mipmap level (from largest to smallest):
+              - Mipmap data
+
+        Args:
+            raw_data: Raw image data bytes to split
+        """
+        # Determine format
+        fourcc = None
+        dxgi_format = None
+
+        if self.header10:
+            dxgi_format = self.header10.dxgiFormat
+        elif self.header.ddspf.dwFlags & DDPF.FOURCC:
+            fourcc = self.header.ddspf.dwFourCC
+
+        # Determine number of subresources
+        mipmap_count = self.header.dwMipMapCount if self.header.dwMipMapCount > 0 else 1
+
+        # Determine if this is a cubemap
+        is_cubemap = bool(self.header.dwCaps2 & DDSCAPS2.CUBEMAP)
+        num_faces = 6 if is_cubemap else 1
+
+        # Determine array size (DX10 only, otherwise 1)
+        array_size = self.header10.arraySize if self.header10 and self.header10.arraySize > 0 else 1
+
+        # Base dimensions
+        base_width = self.header.dwWidth
+        base_height = self.header.dwHeight
+
+        # Split data into subresources
+        self.data = []
+        offset = 0
+
+        for array_idx in range(array_size):
+            for face_idx in range(num_faces):
+                for mip_idx in range(mipmap_count):
+                    # Calculate dimensions for this mipmap level
+                    width = max(1, base_width >> mip_idx)
+                    height = max(1, base_height >> mip_idx)
+
+                    # Calculate size for this mipmap level
+                    mip_size = self._get_mipmap_size(width, height, fourcc, dxgi_format)
+
+                    # Extract subresource data
+                    if offset + mip_size > len(raw_data):
+                        raise ValueError(
+                            f"Not enough data for subresource (array={array_idx}, face={face_idx}, mip={mip_idx}). "
+                            f"Expected {mip_size} bytes at offset {offset}, but only {len(raw_data) - offset} bytes remaining."
+                        )
+
+                    subresource = raw_data[offset:offset + mip_size]
+                    self.data.append(subresource)
+                    offset += mip_size
+
+    def _get_mipmap_size(self, width: int, height: int, fourcc: Optional[int], dxgi_format: Optional[DXGI_FORMAT]) -> int:
+        """
+        Calculate the size in bytes of a single mipmap level for the given format.
+
+        Args:
+            width: Width of mipmap level in pixels
+            height: Height of mipmap level in pixels
+            fourcc: FourCC format code (if applicable)
+            dxgi_format: DXGI format (if applicable)
+
+        Returns:
+            Size of the mipmap level in bytes
+        """
+        # Some DDS files store DXGI format codes directly in dwFourCC without DX10 header
+        # Try to interpret fourcc as DXGI format if it's a small integer
+        if fourcc is not None and dxgi_format is None and fourcc < 256:
+            try:
+                dxgi_format = DXGI_FORMAT(fourcc)
+            except ValueError:
+                pass
+        # BC1/DXT1 - 8 bytes per 4x4 block
+        if fourcc == FourCC.DXT1 or dxgi_format in (DXGI_FORMAT.BC1_UNORM, DXGI_FORMAT.BC1_UNORM_SRGB, DXGI_FORMAT.BC1_TYPELESS):
+            blocks_x = (width + 3) // 4
+            blocks_y = (height + 3) // 4
+            return blocks_x * blocks_y * 8
+
+        # BC2/DXT3 - 16 bytes per 4x4 block
+        if fourcc in (FourCC.DXT2, FourCC.DXT3) or dxgi_format in (DXGI_FORMAT.BC2_UNORM, DXGI_FORMAT.BC2_UNORM_SRGB, DXGI_FORMAT.BC2_TYPELESS):
+            blocks_x = (width + 3) // 4
+            blocks_y = (height + 3) // 4
+            return blocks_x * blocks_y * 16
+
+        # BC3/DXT5 - 16 bytes per 4x4 block
+        if fourcc in (FourCC.DXT4, FourCC.DXT5) or dxgi_format in (DXGI_FORMAT.BC3_UNORM, DXGI_FORMAT.BC3_UNORM_SRGB, DXGI_FORMAT.BC3_TYPELESS):
+            blocks_x = (width + 3) // 4
+            blocks_y = (height + 3) // 4
+            return blocks_x * blocks_y * 16
+
+        # BC4 - 8 bytes per 4x4 block
+        if fourcc in (FourCC.BC4U, FourCC.BC4S, FourCC.ATI1) or dxgi_format in (DXGI_FORMAT.BC4_UNORM, DXGI_FORMAT.BC4_SNORM, DXGI_FORMAT.BC4_TYPELESS):
+            blocks_x = (width + 3) // 4
+            blocks_y = (height + 3) // 4
+            return blocks_x * blocks_y * 8
+
+        # BC5 - 16 bytes per 4x4 block
+        if fourcc in (FourCC.BC5U, FourCC.BC5S, FourCC.ATI2) or dxgi_format in (DXGI_FORMAT.BC5_UNORM, DXGI_FORMAT.BC5_SNORM, DXGI_FORMAT.BC5_TYPELESS):
+            blocks_x = (width + 3) // 4
+            blocks_y = (height + 3) // 4
+            return blocks_x * blocks_y * 16
+
+        # BC7 - 16 bytes per 4x4 block
+        if dxgi_format in (DXGI_FORMAT.BC7_UNORM, DXGI_FORMAT.BC7_UNORM_SRGB, DXGI_FORMAT.BC7_TYPELESS):
+            blocks_x = (width + 3) // 4
+            blocks_y = (height + 3) // 4
+            return blocks_x * blocks_y * 16
+
+        # Uncompressed formats - calculate based on bytes per pixel
+        if dxgi_format is not None:
+            bytes_per_pixel = self._get_bytes_per_pixel(dxgi_format)
+            if bytes_per_pixel > 0:
+                return width * height * bytes_per_pixel
+
+        raise NotImplementedError(f"Mipmap size calculation not implemented for {self.get_format_str()}")
+
+    def _get_bytes_per_pixel(self, dxgi_format: DXGI_FORMAT) -> int:
+        """
+        Get bytes per pixel for uncompressed DXGI formats
+
+        Args:
+            dxgi_format: DXGI format enum value
+
+        Returns:
+            Bytes per pixel, or 0 if format is not recognized as uncompressed
+        """
+        # 128-bit formats (16 bytes per pixel)
+        if dxgi_format in (
+            DXGI_FORMAT.R32G32B32A32_TYPELESS,
+            DXGI_FORMAT.R32G32B32A32_FLOAT,
+            DXGI_FORMAT.R32G32B32A32_UINT,
+            DXGI_FORMAT.R32G32B32A32_SINT,
+        ):
+            return 16
+
+        # 96-bit formats (12 bytes per pixel)
+        if dxgi_format in (
+            DXGI_FORMAT.R32G32B32_TYPELESS,
+            DXGI_FORMAT.R32G32B32_FLOAT,
+            DXGI_FORMAT.R32G32B32_UINT,
+            DXGI_FORMAT.R32G32B32_SINT,
+        ):
+            return 12
+
+        # 64-bit formats (8 bytes per pixel)
+        if dxgi_format in (
+            DXGI_FORMAT.R16G16B16A16_TYPELESS,
+            DXGI_FORMAT.R16G16B16A16_FLOAT,
+            DXGI_FORMAT.R16G16B16A16_UNORM,
+            DXGI_FORMAT.R16G16B16A16_UINT,
+            DXGI_FORMAT.R16G16B16A16_SNORM,
+            DXGI_FORMAT.R16G16B16A16_SINT,
+            DXGI_FORMAT.R32G32_TYPELESS,
+            DXGI_FORMAT.R32G32_FLOAT,
+            DXGI_FORMAT.R32G32_UINT,
+            DXGI_FORMAT.R32G32_SINT,
+        ):
+            return 8
+
+        # 32-bit formats (4 bytes per pixel)
+        if dxgi_format in (
+            DXGI_FORMAT.R10G10B10A2_TYPELESS,
+            DXGI_FORMAT.R10G10B10A2_UNORM,
+            DXGI_FORMAT.R10G10B10A2_UINT,
+            DXGI_FORMAT.R11G11B10_FLOAT,
+            DXGI_FORMAT.R8G8B8A8_TYPELESS,
+            DXGI_FORMAT.R8G8B8A8_UNORM,
+            DXGI_FORMAT.R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT.R8G8B8A8_UINT,
+            DXGI_FORMAT.R8G8B8A8_SNORM,
+            DXGI_FORMAT.R8G8B8A8_SINT,
+            DXGI_FORMAT.R16G16_TYPELESS,
+            DXGI_FORMAT.R16G16_FLOAT,
+            DXGI_FORMAT.R16G16_UNORM,
+            DXGI_FORMAT.R16G16_UINT,
+            DXGI_FORMAT.R16G16_SNORM,
+            DXGI_FORMAT.R16G16_SINT,
+            DXGI_FORMAT.R32_TYPELESS,
+            DXGI_FORMAT.D32_FLOAT,
+            DXGI_FORMAT.R32_FLOAT,
+            DXGI_FORMAT.R32_UINT,
+            DXGI_FORMAT.R32_SINT,
+            DXGI_FORMAT.B8G8R8A8_UNORM,
+            DXGI_FORMAT.B8G8R8X8_UNORM,
+            DXGI_FORMAT.B8G8R8A8_TYPELESS,
+            DXGI_FORMAT.B8G8R8A8_UNORM_SRGB,
+            DXGI_FORMAT.B8G8R8X8_TYPELESS,
+            DXGI_FORMAT.B8G8R8X8_UNORM_SRGB,
+        ):
+            return 4
+
+        # 16-bit formats (2 bytes per pixel)
+        if dxgi_format in (
+            DXGI_FORMAT.R8G8_TYPELESS,
+            DXGI_FORMAT.R8G8_UNORM,
+            DXGI_FORMAT.R8G8_UINT,
+            DXGI_FORMAT.R8G8_SNORM,
+            DXGI_FORMAT.R8G8_SINT,
+            DXGI_FORMAT.R16_TYPELESS,
+            DXGI_FORMAT.R16_FLOAT,
+            DXGI_FORMAT.D16_UNORM,
+            DXGI_FORMAT.R16_UNORM,
+            DXGI_FORMAT.R16_UINT,
+            DXGI_FORMAT.R16_SNORM,
+            DXGI_FORMAT.R16_SINT,
+            DXGI_FORMAT.B5G6R5_UNORM,
+            DXGI_FORMAT.B5G5R5A1_UNORM,
+            DXGI_FORMAT.B4G4R4A4_UNORM,
+        ):
+            return 2
+
+        # 8-bit formats (1 byte per pixel)
+        if dxgi_format in (
+            DXGI_FORMAT.R8_TYPELESS,
+            DXGI_FORMAT.R8_UNORM,
+            DXGI_FORMAT.R8_UINT,
+            DXGI_FORMAT.R8_SNORM,
+            DXGI_FORMAT.R8_SINT,
+            DXGI_FORMAT.A8_UNORM,
+            DXGI_FORMAT.P8,
+        ):
+            return 1
+
+        # Format not recognized or compressed
+        return 0
+
+    def get_format_str(self) -> str:
+        """Get a human-readable format string"""
+        # Determine format
+        fourcc = None
+        dxgi_format = None
+
+        if self.header10:
+            dxgi_format = self.header10.dxgiFormat
+        elif self.header.ddspf.dwFlags & DDPF.FOURCC:
+            fourcc = self.header.ddspf.dwFourCC
+
+        # Try to interpret fourcc as DXGI format if it's a small integer
+        if fourcc is not None and dxgi_format is None and fourcc < 256:
+            try:
+                dxgi_format = DXGI_FORMAT(fourcc)
+                fourcc = None  # Clear fourcc since we're using dxgi_format
+            except ValueError:
+                pass
+
+        if fourcc:
+            try:
+                fourcc_enum = FourCC(fourcc)
+                format_str = f"FourCC {fourcc_enum.name}"
+            except ValueError:
+                fourcc_bytes = fourcc.to_bytes(4, 'little')
+                format_str = f"FourCC 0x{fourcc:08X} ({fourcc_bytes})"
+        elif dxgi_format:
+            format_str = f"{dxgi_format.name}"
+        else:
+            format_str = "Unknown format"
+        return format_str
+
+    def get_width(self) -> int:
+        """Get the width of the texture in pixels"""
+        return self.header.dwWidth
+
+    def get_height(self) -> int:
+        """Get the height of the texture in pixels"""
+        return self.header.dwHeight
+
+    def get_depth(self) -> int:
+        """Get the depth of the texture (for volume textures), or 0 if not a volume texture"""
+        return self.header.dwDepth
+
+    def get_mip_count(self) -> int:
+        """Get the number of mipmap levels"""
+        return self.header.dwMipMapCount if self.header.dwMipMapCount > 0 else 1
+
+    def get_size(self) -> int:
+        """Get the total size of all subresource data in bytes"""
+        return sum(len(subresource) for subresource in self.data)
+
+    def get_dxgi_format(self) -> Optional[int]:
+        """
+        Get the DXGI format enum value (integer).
+        Returns None if not using DX10 extended header.
+        """
+        if self.header10:
+            return self.header10.dxgiFormat.value
+        return None
+
+    def get_subresource_count(self) -> int:
+        """Get the total number of subresources (mipmap levels * array slices * faces)"""
+        return len(self.data)
+
+    def _get_subresource_indices(self, subresource_index: int) -> tuple[int, int, int]:
+        """
+        Convert a flat subresource index to (array_index, face_index, mip_level).
+
+        Args:
+            subresource_index: Flat subresource index
+
+        Returns:
+            Tuple of (array_index, face_index, mip_level)
+        """
+        mipmap_count = self.get_mip_count()
+        is_cubemap = bool(self.header.dwCaps2 & DDSCAPS2.CUBEMAP)
+        num_faces = 6 if is_cubemap else 1
+        array_size = self.header10.arraySize if self.header10 and self.header10.arraySize > 0 else 1
+
+        # Reverse the calculation from _split_subresources
+        # Order is: array -> face -> mip
+        mip_level = subresource_index % mipmap_count
+        remaining = subresource_index // mipmap_count
+        face_index = remaining % num_faces
+        array_index = remaining // num_faces
+
+        return (array_index, face_index, mip_level)
+
+    def get_subresource_width(self, subresource_index: int) -> int:
+        """
+        Get the width of a specific subresource in pixels.
+
+        Args:
+            subresource_index: Index of the subresource
+
+        Returns:
+            Width in pixels
+        """
+        if subresource_index < 0 or subresource_index >= len(self.data):
+            raise ValueError(f"Invalid subresource index {subresource_index}. Texture has {len(self.data)} subresource(s).")
+
+        _, _, mip_level = self._get_subresource_indices(subresource_index)
+        return max(1, self.header.dwWidth >> mip_level)
+
+    def get_subresource_height(self, subresource_index: int) -> int:
+        """
+        Get the height of a specific subresource in pixels.
+
+        Args:
+            subresource_index: Index of the subresource
+
+        Returns:
+            Height in pixels
+        """
+        if subresource_index < 0 or subresource_index >= len(self.data):
+            raise ValueError(f"Invalid subresource index {subresource_index}. Texture has {len(self.data)} subresource(s).")
+
+        _, _, mip_level = self._get_subresource_indices(subresource_index)
+        return max(1, self.header.dwHeight >> mip_level)
+
+    def get_subresource_depth(self, subresource_index: int) -> int:
+        """
+        Get the depth of a specific subresource (for volume textures).
+
+        Args:
+            subresource_index: Index of the subresource
+
+        Returns:
+            Depth in slices (1 for non-volume textures)
+        """
+        if subresource_index < 0 or subresource_index >= len(self.data):
+            raise ValueError(f"Invalid subresource index {subresource_index}. Texture has {len(self.data)} subresource(s).")
+
+        if self.header.dwDepth == 0:
+            return 1
+
+        _, _, mip_level = self._get_subresource_indices(subresource_index)
+        return max(1, self.header.dwDepth >> mip_level)
+
+    def get_subresource_size(self, subresource_index: int) -> int:
+        """
+        Get the size of a specific subresource in bytes.
+
+        Args:
+            subresource_index: Index of the subresource
+
+        Returns:
+            Size in bytes
+        """
+        if subresource_index < 0 or subresource_index >= len(self.data):
+            raise ValueError(f"Invalid subresource index {subresource_index}. Texture has {len(self.data)} subresource(s).")
+
+        return len(self.data[subresource_index])
+
+    def get_subresource_row_pitch(self, subresource_index: int) -> int:
+        """
+        Get the row pitch (bytes per row) for a specific subresource.
+        For block-compressed formats, this is the number of bytes per row of blocks.
+
+        Args:
+            subresource_index: Index of the subresource
+
+        Returns:
+            Row pitch in bytes
+        """
+        if subresource_index < 0 or subresource_index >= len(self.data):
+            raise ValueError(f"Invalid subresource index {subresource_index}. Texture has {len(self.data)} subresource(s).")
+
+        width = self.get_subresource_width(subresource_index)
+        height = self.get_subresource_height(subresource_index)
+
+        # Determine format
+        fourcc = None
+        dxgi_format = None
+
+        if self.header10:
+            dxgi_format = self.header10.dxgiFormat
+        elif self.header.ddspf.dwFlags & DDPF.FOURCC:
+            fourcc = self.header.ddspf.dwFourCC
+
+        # Try to interpret fourcc as DXGI format if it's a small integer
+        if fourcc is not None and dxgi_format is None and fourcc < 256:
+            try:
+                dxgi_format = DXGI_FORMAT(fourcc)
+            except ValueError:
+                pass
+
+        # For block-compressed formats, calculate row pitch based on blocks
+        # BC1/DXT1 - 8 bytes per 4x4 block
+        if fourcc == FourCC.DXT1 or dxgi_format in (DXGI_FORMAT.BC1_UNORM, DXGI_FORMAT.BC1_UNORM_SRGB, DXGI_FORMAT.BC1_TYPELESS):
+            blocks_x = (width + 3) // 4
+            return blocks_x * 8
+
+        # BC2/DXT3, BC3/DXT5, BC5, BC7 - 16 bytes per 4x4 block
+        if (fourcc in (FourCC.DXT2, FourCC.DXT3, FourCC.DXT4, FourCC.DXT5, FourCC.BC5U, FourCC.BC5S, FourCC.ATI2) or
+            dxgi_format in (DXGI_FORMAT.BC2_UNORM, DXGI_FORMAT.BC2_UNORM_SRGB, DXGI_FORMAT.BC2_TYPELESS,
+                           DXGI_FORMAT.BC3_UNORM, DXGI_FORMAT.BC3_UNORM_SRGB, DXGI_FORMAT.BC3_TYPELESS,
+                           DXGI_FORMAT.BC5_UNORM, DXGI_FORMAT.BC5_SNORM, DXGI_FORMAT.BC5_TYPELESS,
+                           DXGI_FORMAT.BC7_UNORM, DXGI_FORMAT.BC7_UNORM_SRGB, DXGI_FORMAT.BC7_TYPELESS)):
+            blocks_x = (width + 3) // 4
+            return blocks_x * 16
+
+        # BC4 - 8 bytes per 4x4 block
+        if (fourcc in (FourCC.BC4U, FourCC.BC4S, FourCC.ATI1) or
+            dxgi_format in (DXGI_FORMAT.BC4_UNORM, DXGI_FORMAT.BC4_SNORM, DXGI_FORMAT.BC4_TYPELESS)):
+            blocks_x = (width + 3) // 4
+            return blocks_x * 8
+
+        # Uncompressed formats - bytes per pixel * width
+        if dxgi_format is not None:
+            bytes_per_pixel = self._get_bytes_per_pixel(dxgi_format)
+            if bytes_per_pixel > 0:
+                return width * bytes_per_pixel
+
+        raise NotImplementedError(f"Row pitch calculation not implemented for {self.get_format_str()}")
+
+    def get_subresource_row_count(self, subresource_index: int) -> int:
+        """
+        Get the number of rows for a specific subresource.
+        For block-compressed formats, this is the number of rows of blocks.
+
+        Args:
+            subresource_index: Index of the subresource
+
+        Returns:
+            Number of rows (or rows of blocks for compressed formats)
+        """
+        if subresource_index < 0 or subresource_index >= len(self.data):
+            raise ValueError(f"Invalid subresource index {subresource_index}. Texture has {len(self.data)} subresource(s).")
+
+        height = self.get_subresource_height(subresource_index)
+
+        # Determine format
+        fourcc = None
+        dxgi_format = None
+
+        if self.header10:
+            dxgi_format = self.header10.dxgiFormat
+        elif self.header.ddspf.dwFlags & DDPF.FOURCC:
+            fourcc = self.header.ddspf.dwFourCC
+
+        # Try to interpret fourcc as DXGI format if it's a small integer
+        if fourcc is not None and dxgi_format is None and fourcc < 256:
+            try:
+                dxgi_format = DXGI_FORMAT(fourcc)
+            except ValueError:
+                pass
+
+        # For block-compressed formats, calculate row count based on blocks
+        is_block_compressed = (
+            fourcc in (FourCC.DXT1, FourCC.DXT2, FourCC.DXT3, FourCC.DXT4, FourCC.DXT5,
+                      FourCC.BC4U, FourCC.BC4S, FourCC.ATI1, FourCC.BC5U, FourCC.BC5S, FourCC.ATI2) or
+            dxgi_format in (DXGI_FORMAT.BC1_UNORM, DXGI_FORMAT.BC1_UNORM_SRGB, DXGI_FORMAT.BC1_TYPELESS,
+                           DXGI_FORMAT.BC2_UNORM, DXGI_FORMAT.BC2_UNORM_SRGB, DXGI_FORMAT.BC2_TYPELESS,
+                           DXGI_FORMAT.BC3_UNORM, DXGI_FORMAT.BC3_UNORM_SRGB, DXGI_FORMAT.BC3_TYPELESS,
+                           DXGI_FORMAT.BC4_UNORM, DXGI_FORMAT.BC4_SNORM, DXGI_FORMAT.BC4_TYPELESS,
+                           DXGI_FORMAT.BC5_UNORM, DXGI_FORMAT.BC5_SNORM, DXGI_FORMAT.BC5_TYPELESS,
+                           DXGI_FORMAT.BC7_UNORM, DXGI_FORMAT.BC7_UNORM_SRGB, DXGI_FORMAT.BC7_TYPELESS)
+        )
+
+        if is_block_compressed:
+            # For block-compressed formats, return number of block rows
+            return (height + 3) // 4
+
+        # For uncompressed formats, return the height
+        return height
+
+    def get_subresource_offset(self, subresource_index: int) -> int:
+        """
+        Get the offset of a specific subresource from the start of the image data.
+        This does not include the header size - it's the offset within the image data itself.
+
+        Args:
+            subresource_index: Index of the subresource
+
+        Returns:
+            Offset in bytes from the start of the image data (after headers)
+        """
+        if subresource_index < 0 or subresource_index >= len(self.data):
+            raise ValueError(f"Invalid subresource index {subresource_index}. Texture has {len(self.data)} subresource(s).")
+
+        # Sum sizes of all previous subresources
+        offset = 0
+        for i in range(subresource_index):
+            offset += len(self.data[i])
+
+        return offset
+
+    def to_image(self, mipmap_level: int = 0, array_index: int = 0, face_index: int = 0) -> np.ndarray:
+        """
+        Convert DDS texture to numpy array
+
+        Args:
+            mipmap_level: Mipmap level to extract (0 = full resolution)
+            array_index: Array slice index (0 for non-arrays)
+            face_index: Cubemap face index (0 for non-cubemaps)
+
+        Returns:
+            numpy array of shape (height, width, 4) with dtype uint8 (RGBA values 0-255)
+
+            Can be saved with imageio:
+            - imageio.imwrite('output.png', array)
+            - imageio.imwrite('output.jpg', array)
+
+        Raises:
+            ValueError: If the format is not supported or indices are invalid
+            NotImplementedError: If the format decompressor is not implemented yet
+        """
+        # Determine format
+        fourcc = None
+        dxgi_format = None
+
+        if self.header10:
+            dxgi_format = self.header10.dxgiFormat
+        elif self.header.ddspf.dwFlags & DDPF.FOURCC:
+            fourcc = self.header.ddspf.dwFourCC
+
+        # Some DDS files store DXGI format codes directly in dwFourCC without DX10 header
+        # Try to interpret fourcc as DXGI format if it's a small integer
+        if fourcc is not None and dxgi_format is None and fourcc < 256:
+            try:
+                dxgi_format = DXGI_FORMAT(fourcc)
+                fourcc = None  # Clear fourcc since we're using dxgi_format instead
+            except ValueError:
+                pass
+
+        # Validate indices
+        mipmap_count = self.header.dwMipMapCount if self.header.dwMipMapCount > 0 else 1
+        if mipmap_level < 0 or mipmap_level >= mipmap_count:
+            raise ValueError(f"Invalid mipmap level {mipmap_level}. Texture has {mipmap_count} mipmap level(s).")
+
+        is_cubemap = bool(self.header.dwCaps2 & DDSCAPS2.CUBEMAP)
+        num_faces = 6 if is_cubemap else 1
+        if face_index < 0 or face_index >= num_faces:
+            raise ValueError(f"Invalid face index {face_index}. Texture has {num_faces} face(s).")
+
+        array_size = self.header10.arraySize if self.header10 and self.header10.arraySize > 0 else 1
+        if array_index < 0 or array_index >= array_size:
+            raise ValueError(f"Invalid array index {array_index}. Texture has {array_size} array slice(s).")
+
+        # Calculate subresource index
+        subresource_index = (array_index * num_faces + face_index) * mipmap_count + mipmap_level
+
+        # Validate subresource index
+        if subresource_index >= len(self.data):
+            raise ValueError(
+                f"Invalid subresource index {subresource_index} "
+                f"(array={array_index}, face={face_index}, mip={mipmap_level}). "
+                f"Texture has {len(self.data)} subresource(s)."
+            )
+
+        # Calculate dimensions for the requested mipmap level
+        base_width = self.header.dwWidth
+        base_height = self.header.dwHeight
+        width = max(1, base_width >> mipmap_level)
+        height = max(1, base_height >> mipmap_level)
+
+        # Get data for this subresource
+        mipmap_data = self.data[subresource_index]
+
+        # Select appropriate decompressor
+        decompressor: Optional[TextureDecompressor] = None
+
+        if fourcc == FourCC.DXT1:
+            decompressor = BC1Decompressor()
+        elif dxgi_format in (DXGI_FORMAT.BC1_UNORM, DXGI_FORMAT.BC1_UNORM_SRGB, DXGI_FORMAT.BC1_TYPELESS):
+            decompressor = BC1Decompressor()
+        elif fourcc in (FourCC.DXT2, FourCC.DXT3):
+            decompressor = BC2Decompressor()
+        elif dxgi_format in (DXGI_FORMAT.BC2_UNORM, DXGI_FORMAT.BC2_UNORM_SRGB, DXGI_FORMAT.BC2_TYPELESS):
+            decompressor = BC2Decompressor()
+        elif fourcc in (FourCC.DXT4, FourCC.DXT5):
+            decompressor = BC3Decompressor()
+        elif dxgi_format in (DXGI_FORMAT.BC3_UNORM, DXGI_FORMAT.BC3_UNORM_SRGB, DXGI_FORMAT.BC3_TYPELESS):
+            decompressor = BC3Decompressor()
+        elif fourcc in (FourCC.BC4U, FourCC.BC4S, FourCC.ATI1):
+            decompressor = BC4Decompressor()
+        elif dxgi_format in (DXGI_FORMAT.BC4_UNORM, DXGI_FORMAT.BC4_SNORM, DXGI_FORMAT.BC4_TYPELESS):
+            decompressor = BC4Decompressor()
+        elif fourcc in (FourCC.BC5U, FourCC.BC5S, FourCC.ATI2):
+            decompressor = BC5Decompressor()
+        elif dxgi_format in (DXGI_FORMAT.BC5_UNORM, DXGI_FORMAT.BC5_SNORM, DXGI_FORMAT.BC5_TYPELESS):
+            decompressor = BC5Decompressor()
+        elif dxgi_format in (DXGI_FORMAT.BC7_UNORM, DXGI_FORMAT.BC7_UNORM_SRGB, DXGI_FORMAT.BC7_TYPELESS):
+            decompressor = BC7Decompressor()
+        else:
+            raise NotImplementedError(f"Decompression not yet implemented for {self.get_format_str()}")
+
+        # Decompress texture data for this mipmap level
+        rgba_data = decompressor.decompress(mipmap_data, width, height)
+
+        # Handle premultiplied alpha formats
+        # DXT2 and DXT4 use premultiplied alpha and need conversion
+        is_premultiplied = fourcc in (FourCC.DXT2, FourCC.DXT4)
+        if is_premultiplied:
+            rgba_data = _unpremultiply_alpha(rgba_data)
+
+        # Return numpy array directly
+        # BC6H returns float32 HDR data, other formats return uint8
+        return rgba_data

@@ -5,11 +5,12 @@ A pure Python library for reading and converting DDS (DirectDraw Surface) textur
 ## Features
 
 - Read DDS texture files with various compression formats
-- Support for BC1/DXT1, BC2/DXT3, BC3/DXT5, BC4, and BC5 compression
-- Convert DDS textures to PIL Images
+- Support for BC1/DXT1, BC2/DXT3, BC3/DXT5, BC4, BC5, and BC7 compression
+- Convert DDS textures to numpy arrays compatible with imageio
 - Extract specific mipmap levels
-- Vectorized NumPy-based decompression for performance
+- Vectorized NumPy-based decompression with Numba JIT for high performance
 - Command-line interface for quick conversions
+- Export to any format supported by imageio (PNG, JPEG, TIFF, etc.)
 
 ## Installation
 
@@ -35,7 +36,7 @@ pip install ./dist/puredds-version-pyX-none-any.whl
 
 ```python
 from puredds import DDS
-from PIL import Image
+import imageio.v3 as iio
 
 # Read a DDS file
 with open('texture.dds', 'rb') as f:
@@ -46,13 +47,14 @@ dds = DDS.from_bytes(data)
 # Print information about the texture
 print(dds)
 
-# Convert to PIL Image
-image = dds.to_image()
-image.save('output.png')
+# Convert to numpy array and save
+# Returns uint8 RGBA array
+image_array = dds.to_image()
+iio.imwrite('output.png', image_array)
 
 # Extract a specific mipmap level
 mipmap1 = dds.to_image(mipmap_level=1)
-mipmap1.save('mipmap1.png')
+iio.imwrite('mipmap1.png', mipmap1)
 ```
 
 ### Command Line
@@ -75,8 +77,17 @@ puredds texture.dds -o output.png -m 1
 - **BC3 (DXT4/DXT5)**: RGB compression with interpolated alpha
 - **BC4**: Single-channel compression (grayscale)
 - **BC5**: Two-channel compression (typically for normal maps)
+- **BC7**: High-quality RGB/RGBA compression with multiple encoding modes
 
 Both legacy FourCC formats and DX10 DXGI formats are supported.
+
+## Performance Note
+
+**First-time decompression**: The first time you decompress a texture in each format, Numba will compile the decompression functions to machine code. This compilation takes a few seconds but only happens once. The compiled code is cached, so subsequent runs will be significantly faster.
+
+For optimal performance in production:
+- Warm up the cache by decompressing a sample texture of each format you'll use
+- Distribute the Numba cache directory (`__pycache__/*.nbc` files) with your application if needed
 
 ## Building from Source
 
