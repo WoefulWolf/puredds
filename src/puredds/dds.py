@@ -2,7 +2,7 @@
 from typing import Optional, List
 import numpy as np
 
-from .enums import DDPF, DDSCAPS2, FourCC, DXGI_FORMAT
+from .enums import DDPF, DDSCAPS, DDSCAPS2, DDSD, FourCC, DXGI_FORMAT, DDS_RESOURCE_MISC
 from .headers import DDS_HEADER, DDS_HEADER_DXT10
 from .decompressors import (
     TextureDecompressor,
@@ -13,6 +13,32 @@ from .decompressors import (
     BC5Decompressor,
     BC7Decompressor,
 )
+
+
+def _format_flags(value: int, flag_enum) -> str:
+    """
+    Format an integer flag value as a list of flag names separated by ' | '.
+
+    Args:
+        value: The integer flag value
+        flag_enum: The IntFlag enum class to use for decoding
+
+    Returns:
+        String with flag names separated by ' | ', or '0' if no flags are set
+    """
+    if value == 0:
+        return '0'
+
+    # Get all set flags
+    flags = []
+    for flag in flag_enum:
+        if value & flag:
+            flags.append(flag.name)
+
+    if not flags:
+        return f'0x{value:X}'
+
+    return ' | '.join(flags)
 
 
 def _unpremultiply_alpha(rgba_data: np.ndarray) -> np.ndarray:
@@ -66,14 +92,13 @@ class DDS:
         lines = ["DDS File Information:"]
         lines.append(f"  Magic: {self.magic}")
         lines.append(f"  Dimensions: {self.header.dwWidth}x{self.header.dwHeight}")
-
-        if self.header.dwDepth > 0:
-            lines.append(f"  Depth: {self.header.dwDepth}")
+        lines.append(f"  Depth: {self.header.dwDepth}")
 
         if self.header.dwMipMapCount > 0:
             lines.append(f"  Mipmap Levels: {self.header.dwMipMapCount}")
 
-        lines.append(f"  Flags: {self.header.dwFlags}")
+        lines.append(f"  Flags: {_format_flags(self.header.dwFlags, DDSD)}")
+
 
         # Format information
         if self.header10:
@@ -83,7 +108,7 @@ class DDS:
             if self.header10.arraySize > 1:
                 lines.append(f"    Array Size: {self.header10.arraySize}")
             if self.header10.miscFlag:
-                lines.append(f"    Misc Flags: {self.header10.miscFlag}")
+                lines.append(f"    Misc Flags: {_format_flags(self.header10.miscFlag, DDS_RESOURCE_MISC)}")
         else:
             # Try to decode FourCC if present
             if self.header.ddspf.dwFlags & DDPF.FOURCC:
@@ -101,11 +126,11 @@ class DDS:
                 if self.header.ddspf.dwFlags & DDPF.ALPHAPIXELS:
                     lines.append(f"    With Alpha")
             else:
-                lines.append(f"  Format: Other (flags: {self.header.ddspf.dwFlags})")
+                lines.append(f"  Format: Other (flags: {_format_flags(self.header.ddspf.dwFlags, DDPF)})")
 
-        lines.append(f"  Caps: {self.header.dwCaps}")
+        lines.append(f"  Caps: {_format_flags(self.header.dwCaps, DDSCAPS)}")
         if self.header.dwCaps2:
-            lines.append(f"  Caps2: {self.header.dwCaps2}")
+            lines.append(f"  Caps2: {_format_flags(self.header.dwCaps2, DDSCAPS2)}")
 
         total_data_size = sum(len(subresource) for subresource in self.data)
         lines.append(f"  Subresources: {len(self.data)}")
