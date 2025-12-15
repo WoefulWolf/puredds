@@ -2,7 +2,7 @@
 from typing import Optional, List
 import numpy as np
 
-from .enums import DDPF, DDSCAPS, DDSCAPS2, DDSD, FourCC, DXGI_FORMAT, DDS_RESOURCE_MISC
+from .enums import DDPF, DDSCAPS, DDSCAPS2, DDSD, FourCC, DXGI_FORMAT, DDS_RESOURCE_MISC, D3D10_RESOURCE_DIMENSION
 from .headers import DDS_HEADER, DDS_HEADER_DXT10
 from .decompressors import (
     TextureDecompressor,
@@ -169,15 +169,40 @@ class DDS:
 
         return dds
 
+    def is_volume(self) -> bool:
+        """
+        Check if this is a volume (3D) texture.
+        Checks both the legacy DDSCAPS2.VOLUME flag and DX10 resourceDimension.
+
+        Returns:
+            True if this is a volume texture, False otherwise
+        """
+        # Check DX10 header resourceDimension (modern method)
+        if self.header10 and self.header10.resourceDimension == D3D10_RESOURCE_DIMENSION.TEXTURE3D:
+            return True
+
+        # Check legacy DDSCAPS2.VOLUME flag (older method)
+        if self.header.dwCaps2 & DDSCAPS2.VOLUME:
+            return True
+
+        return False
+
     def _split_subresources(self, raw_data: bytes) -> None:
         """
         Split raw image data into subresources.
 
         Subresources are ordered as:
-        - For each array slice:
-          - For each face (6 for cubemap, 1 otherwise):
-            - For each mipmap level (from largest to smallest):
-              - Mipmap data
+        - For volume textures (3D):
+          - For each array slice:
+            - For each face (6 for cubemap, 1 otherwise):
+              - For each mipmap level (from largest to smallest):
+                - For each depth slice:
+                  - Depth slice data
+        - For non-volume textures:
+          - For each array slice:
+            - For each face (6 for cubemap, 1 otherwise):
+              - For each mipmap level (from largest to smallest):
+                - Mipmap data
 
         Args:
             raw_data: Raw image data bytes to split
@@ -198,6 +223,10 @@ class DDS:
         is_cubemap = bool(self.header.dwCaps2 & DDSCAPS2.CUBEMAP)
         num_faces = 6 if is_cubemap else 1
 
+        # Determine if this is a volume texture
+        is_volume = self.is_volume()
+        base_depth = self.header.dwDepth if is_volume and self.header.dwDepth > 0 else 1
+
         # Determine array size (DX10 only, otherwise 1)
         array_size = self.header10.arraySize if self.header10 and self.header10.arraySize > 0 else 1
 
@@ -215,20 +244,23 @@ class DDS:
                     # Calculate dimensions for this mipmap level
                     width = max(1, base_width >> mip_idx)
                     height = max(1, base_height >> mip_idx)
+                    depth = max(1, base_depth >> mip_idx) if is_volume else 1
 
-                    # Calculate size for this mipmap level
-                    mip_size = self._get_mipmap_size(width, height, fourcc, dxgi_format)
+                    # For volume textures, split by depth slices
+                    for depth_idx in range(depth):
+                        # Calculate size for this depth slice
+                        slice_size = self._get_mipmap_size(width, height, fourcc, dxgi_format)
 
-                    # Extract subresource data
-                    if offset + mip_size > len(raw_data):
-                        raise ValueError(
-                            f"Not enough data for subresource (array={array_idx}, face={face_idx}, mip={mip_idx}). "
-                            f"Expected {mip_size} bytes at offset {offset}, but only {len(raw_data) - offset} bytes remaining."
-                        )
+                        # Extract subresource data
+                        if offset + slice_size > len(raw_data):
+                            raise ValueError(
+                                f"Not enough data for subresource (array={array_idx}, face={face_idx}, mip={mip_idx}, depth={depth_idx}). "
+                                f"Expected {slice_size} bytes at offset {offset}, but only {len(raw_data) - offset} bytes remaining."
+                            )
 
-                    subresource = raw_data[offset:offset + mip_size]
-                    self.data.append(subresource)
-                    offset += mip_size
+                        subresource = raw_data[offset:offset + slice_size]
+                        self.data.append(subresource)
+                        offset += slice_size
 
     def _get_mipmap_size(self, width: int, height: int, fourcc: Optional[int], dxgi_format: Optional[DXGI_FORMAT]) -> int:
         """
@@ -498,29 +530,45 @@ class DDS:
         """Get the total number of subresources (mipmap levels * array slices * faces)"""
         return len(self.data)
 
-    def _get_subresource_indices(self, subresource_index: int) -> tuple[int, int, int]:
+    def _get_subresource_indices(self, subresource_index: int) -> tuple[int, int, int, int]:
         """
-        Convert a flat subresource index to (array_index, face_index, mip_level).
+        Convert a flat subresource index to (array_index, face_index, mip_level, depth_index).
 
         Args:
             subresource_index: Flat subresource index
 
         Returns:
-            Tuple of (array_index, face_index, mip_level)
+            Tuple of (array_index, face_index, mip_level, depth_index)
         """
         mipmap_count = self.get_mip_count()
         is_cubemap = bool(self.header.dwCaps2 & DDSCAPS2.CUBEMAP)
         num_faces = 6 if is_cubemap else 1
         array_size = self.header10.arraySize if self.header10 and self.header10.arraySize > 0 else 1
+        is_volume = self.is_volume()
 
         # Reverse the calculation from _split_subresources
-        # Order is: array -> face -> mip
-        mip_level = subresource_index % mipmap_count
-        remaining = subresource_index // mipmap_count
-        face_index = remaining % num_faces
-        array_index = remaining // num_faces
+        # For volume textures: array -> face -> mip -> depth
+        # For non-volume: array -> face -> mip (depth is always 0)
 
-        return (array_index, face_index, mip_level)
+        if is_volume:
+            # Need to calculate depth slice count for each mip level
+            remaining = subresource_index
+            for array_idx in range(array_size):
+                for face_idx in range(num_faces):
+                    for mip_idx in range(mipmap_count):
+                        depth_count = max(1, self.header.dwDepth >> mip_idx)
+                        if remaining < depth_count:
+                            return (array_idx, face_idx, mip_idx, remaining)
+                        remaining -= depth_count
+            # Should not reach here for valid index
+            raise ValueError(f"Invalid subresource index {subresource_index}")
+        else:
+            # Simple calculation for non-volume textures
+            mip_level = subresource_index % mipmap_count
+            remaining = subresource_index // mipmap_count
+            face_index = remaining % num_faces
+            array_index = remaining // num_faces
+            return (array_index, face_index, mip_level, 0)
 
     def get_subresource_width(self, subresource_index: int) -> int:
         """
@@ -535,7 +583,7 @@ class DDS:
         if subresource_index < 0 or subresource_index >= len(self.data):
             raise ValueError(f"Invalid subresource index {subresource_index}. Texture has {len(self.data)} subresource(s).")
 
-        _, _, mip_level = self._get_subresource_indices(subresource_index)
+        _, _, mip_level, _ = self._get_subresource_indices(subresource_index)
         return max(1, self.header.dwWidth >> mip_level)
 
     def get_subresource_height(self, subresource_index: int) -> int:
@@ -551,27 +599,25 @@ class DDS:
         if subresource_index < 0 or subresource_index >= len(self.data):
             raise ValueError(f"Invalid subresource index {subresource_index}. Texture has {len(self.data)} subresource(s).")
 
-        _, _, mip_level = self._get_subresource_indices(subresource_index)
+        _, _, mip_level, _ = self._get_subresource_indices(subresource_index)
         return max(1, self.header.dwHeight >> mip_level)
 
     def get_subresource_depth(self, subresource_index: int) -> int:
         """
         Get the depth of a specific subresource (for volume textures).
+        Since subresources are now split by depth slice, this always returns 1.
 
         Args:
             subresource_index: Index of the subresource
 
         Returns:
-            Depth in slices (1 for non-volume textures)
+            Always 1 (each subresource is a single depth slice)
         """
         if subresource_index < 0 or subresource_index >= len(self.data):
             raise ValueError(f"Invalid subresource index {subresource_index}. Texture has {len(self.data)} subresource(s).")
 
-        if self.header.dwDepth == 0:
-            return 1
-
-        _, _, mip_level = self._get_subresource_indices(subresource_index)
-        return max(1, self.header.dwDepth >> mip_level)
+        # Since we now split volume textures by depth slices, each subresource is a single 2D slice
+        return 1
 
     def get_subresource_size(self, subresource_index: int) -> int:
         """
@@ -722,7 +768,7 @@ class DDS:
 
         return offset
 
-    def to_image(self, mipmap_level: int = 0, array_index: int = 0, face_index: int = 0) -> np.ndarray:
+    def to_image(self, mipmap_level: int = 0, array_index: int = 0, face_index: int = 0, depth_index: int = 0) -> np.ndarray:
         """
         Convert DDS texture to numpy array
 
@@ -730,6 +776,7 @@ class DDS:
             mipmap_level: Mipmap level to extract (0 = full resolution)
             array_index: Array slice index (0 for non-arrays)
             face_index: Cubemap face index (0 for non-cubemaps)
+            depth_index: Depth slice index for volume textures (0 for non-volume textures)
 
         Returns:
             numpy array of shape (height, width, 4) with dtype uint8 (RGBA values 0-255)
@@ -774,14 +821,43 @@ class DDS:
         if array_index < 0 or array_index >= array_size:
             raise ValueError(f"Invalid array index {array_index}. Texture has {array_size} array slice(s).")
 
+        is_volume = self.is_volume()
+        if is_volume:
+            depth_count = max(1, self.header.dwDepth >> mipmap_level)
+            if depth_index < 0 or depth_index >= depth_count:
+                raise ValueError(f"Invalid depth index {depth_index}. Texture has {depth_count} depth slice(s) at mipmap level {mipmap_level}.")
+        elif depth_index != 0:
+            raise ValueError(f"Depth index must be 0 for non-volume textures.")
+
         # Calculate subresource index
-        subresource_index = (array_index * num_faces + face_index) * mipmap_count + mipmap_level
+        # For volume textures: array -> face -> mip -> depth
+        # For non-volume: array -> face -> mip
+        if is_volume:
+            # Need to count depth slices for all previous mip levels
+            subresource_index = 0
+            for a_idx in range(array_index + 1):
+                for f_idx in range(num_faces):
+                    if a_idx < array_index or f_idx < face_index:
+                        # Add all mipmap levels for this array/face
+                        for m_idx in range(mipmap_count):
+                            d_count = max(1, self.header.dwDepth >> m_idx)
+                            subresource_index += d_count
+                    elif a_idx == array_index and f_idx == face_index:
+                        # Add previous mipmap levels
+                        for m_idx in range(mipmap_level):
+                            d_count = max(1, self.header.dwDepth >> m_idx)
+                            subresource_index += d_count
+                        # Add depth slices for current mipmap level
+                        subresource_index += depth_index
+                        break
+        else:
+            subresource_index = (array_index * num_faces + face_index) * mipmap_count + mipmap_level
 
         # Validate subresource index
         if subresource_index >= len(self.data):
             raise ValueError(
                 f"Invalid subresource index {subresource_index} "
-                f"(array={array_index}, face={face_index}, mip={mipmap_level}). "
+                f"(array={array_index}, face={face_index}, mip={mipmap_level}, depth={depth_index}). "
                 f"Texture has {len(self.data)} subresource(s)."
             )
 
