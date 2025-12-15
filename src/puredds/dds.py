@@ -12,6 +12,7 @@ from .decompressors import (
     BC4Decompressor,
     BC5Decompressor,
     BC7Decompressor,
+    UncompressedDecompressor,
 )
 
 
@@ -895,6 +896,15 @@ class DDS:
             decompressor = BC5Decompressor()
         elif dxgi_format in (DXGI_FORMAT.BC7_UNORM, DXGI_FORMAT.BC7_UNORM_SRGB, DXGI_FORMAT.BC7_TYPELESS):
             decompressor = BC7Decompressor()
+        elif dxgi_format in UncompressedDecompressor.FORMAT_DESCRIPTORS or dxgi_format in (
+            DXGI_FORMAT.R10G10B10A2_UNORM,
+            DXGI_FORMAT.R10G10B10A2_UINT,
+            DXGI_FORMAT.R11G11B10_FLOAT,
+            DXGI_FORMAT.B5G6R5_UNORM,
+            DXGI_FORMAT.B5G5R5A1_UNORM,
+            DXGI_FORMAT.B4G4R4A4_UNORM,
+        ):
+            decompressor = UncompressedDecompressor(dxgi_format)
         else:
             raise NotImplementedError(f"Decompression not yet implemented for {self.get_format_str()}")
 

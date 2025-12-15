@@ -6,6 +6,7 @@ from .bc3 import BC3Decompressor
 from .bc4 import BC4Decompressor
 from .bc5 import BC5Decompressor
 from .bc7 import BC7Decompressor
+from .uncompressed import UncompressedDecompressor
 
 __all__ = [
     'TextureDecompressor',
@@ -15,4 +16,5 @@ __all__ = [
     'BC4Decompressor',
     'BC5Decompressor',
     'BC7Decompressor',
+    'UncompressedDecompressor',
 ]
