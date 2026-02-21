@@ -313,6 +313,12 @@ class DDS:
             blocks_y = (height + 3) // 4
             return blocks_x * blocks_y * 16
 
+        # BC6H - 16 bytes per 4x4 block
+        if dxgi_format in (DXGI_FORMAT.BC6H_UF16, DXGI_FORMAT.BC6H_SF16, DXGI_FORMAT.BC6H_TYPELESS):
+            blocks_x = (width + 3) // 4
+            blocks_y = (height + 3) // 4
+            return blocks_x * blocks_y * 16
+
         # BC7 - 16 bytes per 4x4 block
         if dxgi_format in (DXGI_FORMAT.BC7_UNORM, DXGI_FORMAT.BC7_UNORM_SRGB, DXGI_FORMAT.BC7_TYPELESS):
             blocks_x = (width + 3) // 4
@@ -674,11 +680,12 @@ class DDS:
             blocks_x = (width + 3) // 4
             return blocks_x * 8
 
-        # BC2/DXT3, BC3/DXT5, BC5, BC7 - 16 bytes per 4x4 block
+        # BC2/DXT3, BC3/DXT5, BC5, BC6H, BC7 - 16 bytes per 4x4 block
         if (fourcc in (FourCC.DXT2, FourCC.DXT3, FourCC.DXT4, FourCC.DXT5, FourCC.BC5U, FourCC.BC5S, FourCC.ATI2) or
             dxgi_format in (DXGI_FORMAT.BC2_UNORM, DXGI_FORMAT.BC2_UNORM_SRGB, DXGI_FORMAT.BC2_TYPELESS,
                            DXGI_FORMAT.BC3_UNORM, DXGI_FORMAT.BC3_UNORM_SRGB, DXGI_FORMAT.BC3_TYPELESS,
                            DXGI_FORMAT.BC5_UNORM, DXGI_FORMAT.BC5_SNORM, DXGI_FORMAT.BC5_TYPELESS,
+                           DXGI_FORMAT.BC6H_UF16, DXGI_FORMAT.BC6H_SF16, DXGI_FORMAT.BC6H_TYPELESS,
                            DXGI_FORMAT.BC7_UNORM, DXGI_FORMAT.BC7_UNORM_SRGB, DXGI_FORMAT.BC7_TYPELESS)):
             blocks_x = (width + 3) // 4
             return blocks_x * 16
@@ -738,6 +745,7 @@ class DDS:
                            DXGI_FORMAT.BC3_UNORM, DXGI_FORMAT.BC3_UNORM_SRGB, DXGI_FORMAT.BC3_TYPELESS,
                            DXGI_FORMAT.BC4_UNORM, DXGI_FORMAT.BC4_SNORM, DXGI_FORMAT.BC4_TYPELESS,
                            DXGI_FORMAT.BC5_UNORM, DXGI_FORMAT.BC5_SNORM, DXGI_FORMAT.BC5_TYPELESS,
+                           DXGI_FORMAT.BC6H_UF16, DXGI_FORMAT.BC6H_SF16, DXGI_FORMAT.BC6H_TYPELESS,
                            DXGI_FORMAT.BC7_UNORM, DXGI_FORMAT.BC7_UNORM_SRGB, DXGI_FORMAT.BC7_TYPELESS)
         )
 
