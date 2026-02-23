@@ -72,3 +72,7 @@ Thumbs.db
 *.png
 *.jpg
 *.jpeg
+*.hdr
+*.exr
+*.tif
+*.tiff

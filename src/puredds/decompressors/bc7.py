@@ -79,23 +79,6 @@ def _expand_quantized(value, from_bits, to_bits):
 
 
 @jit(nopython=True, cache=True)
-def _get_anchor_index_for_subset(partition_table, partition_id, subset_index, num_subsets):
-    """
-    Find the anchor pixel index for a given subset by finding the first pixel
-    in raster order that belongs to that subset.
-    """
-    if subset_index == 0:
-        return 0  # Subset 0 always has anchor at pixel 0
-
-    # Find first pixel that belongs to this subset
-    for pixel_idx in range(16):
-        if partition_table[partition_id, pixel_idx] == subset_index:
-            return pixel_idx
-
-    return 0  # Fallback
-
-
-@jit(nopython=True, cache=True)
 def _get_anchor_index(partition_set_id, subset, num_subsets):
     """Get the anchor pixel index for a given subset in a partition"""
 
@@ -118,18 +101,18 @@ def _get_anchor_index(partition_set_id, subset, num_subsets):
     # Anchor indices for 3-subset partitions
     # Subset 1 anchors - Source: Khronos OpenGL BPTC specification Table.A3a
     anchor_indices_3_subset1 = np.array([
-         3,  3,15,15,  8,  3,15,15,  8,  8,  6,  6,  6,  5,  3,  3,
-         3,  3,  8,15,  3,  3,  6,10,  5,  8,  8,  6,  8,  5,15,15,
-         8,15,  3,  5,  6,10,  8,15,15,  3,15,  5,15,15,15,15,
-         3,15,  5,  5,  5,  8,  5,10,  5,10,  8,13,15,12,  3,  3,
+         3, 3,15,15, 8, 3,15,15, 8, 8, 6, 6, 6, 5, 3, 3,
+         3, 3, 8,15, 3, 3, 6,10, 5, 8, 8, 6, 8, 5,15,15,
+         8,15, 3, 5, 6,10, 8,15,15, 3,15, 5,15,15,15,15,
+         3,15, 5, 5, 5, 8, 5,10, 5,10, 8,13,15,12, 3, 3,
     ], dtype=np.uint8)
 
     # Subset 2 anchors - Source: Khronos OpenGL BPTC specification Table.A3b
     anchor_indices_3_subset2 = np.array([
-        15,  8,  8,  3,15,15,  3,  8,15,15,15,15,15,15,15,  8,
-        15,  8,15,  3,15,  8,15,  8,  3,15,  6,10,15,15,10,  8,
-        15,  3,15,10,10,  8,  9,10,  6,15,  8,15,  3,  6,  6,  8,
-        15,  3,15,15,15,15,15,15,15,15,15,15,  3,15,15,  8,
+        15, 8, 8, 3,15,15, 3, 8,15,15,15,15,15,15,15, 8,
+        15, 8,15, 3,15, 8,15, 8, 3,15, 6,10,15,15,10, 8,
+        15, 3,15,10,10, 8, 9,10, 6,15, 8,15, 3, 6, 6, 8,
+        15, 3,15,15,15,15,15,15,15,15,15,15, 3,15,15, 8,
     ], dtype=np.uint8)
 
     if partition_set_id >= 64:

@@ -11,6 +11,7 @@ from .decompressors import (
     BC3Decompressor,
     BC4Decompressor,
     BC5Decompressor,
+    BC6HDecompressor,
     BC7Decompressor,
     UncompressedDecompressor,
 )
@@ -902,6 +903,10 @@ class DDS:
             decompressor = BC5Decompressor()
         elif dxgi_format in (DXGI_FORMAT.BC5_UNORM, DXGI_FORMAT.BC5_SNORM, DXGI_FORMAT.BC5_TYPELESS):
             decompressor = BC5Decompressor()
+        elif dxgi_format in (DXGI_FORMAT.BC6H_UF16, DXGI_FORMAT.BC6H_TYPELESS):
+            decompressor = BC6HDecompressor(signed=False)
+        elif dxgi_format == DXGI_FORMAT.BC6H_SF16:
+            decompressor = BC6HDecompressor(signed=True)
         elif dxgi_format in (DXGI_FORMAT.BC7_UNORM, DXGI_FORMAT.BC7_UNORM_SRGB, DXGI_FORMAT.BC7_TYPELESS):
             decompressor = BC7Decompressor()
         elif dxgi_format in UncompressedDecompressor.FORMAT_DESCRIPTORS or dxgi_format in (

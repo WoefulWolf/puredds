@@ -5,6 +5,7 @@ from .bc2 import BC2Decompressor
 from .bc3 import BC3Decompressor
 from .bc4 import BC4Decompressor
 from .bc5 import BC5Decompressor
+from .bc6h import BC6HDecompressor
 from .bc7 import BC7Decompressor
 from .uncompressed import UncompressedDecompressor
 
@@ -15,6 +16,7 @@ __all__ = [
     'BC3Decompressor',
     'BC4Decompressor',
     'BC5Decompressor',
+    'BC6HDecompressor',
     'BC7Decompressor',
     'UncompressedDecompressor',
 ]
